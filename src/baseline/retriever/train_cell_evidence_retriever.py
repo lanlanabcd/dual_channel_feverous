@@ -1,0 +1,291 @@
+from transformers import BertForSequenceClassification, Trainer, TrainingArguments, AdamW, RobertaForTokenClassification, RobertaTokenizer, AutoTokenizer
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from utils.wiki_page import WikiPage
+from database.feverous_db import FeverousDB
+import torch
+import argparse
+from tqdm import tqdm
+import itertools
+from cleantext import clean
+import unicodedata
+from urllib.parse import unquote
+import os
+
+# os.chdir("{dir}/DCUF_code")
+
+from utils.annotation_processor import AnnotationProcessor, EvidenceType
+avail_classes_test = None
+
+class FEVEROUSDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels, use_labels = True):
+        self.encodings = encodings
+        self.labels = labels
+        self.use_labels = use_labels
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        if self.use_labels:
+            item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+def process_data(claim_verdict_list):
+
+    text = [x[0] for x in claim_verdict_list]#["I love Pixar.", "I don't care for Pixar."]
+
+    labels = [x[1] for x in claim_verdict_list] #get value from enum
+    return text, labels
+
+
+def compute_metrics(pred):
+    labels = list(itertools.chain(*pred.label_ids))
+    preds = list(itertools.chain(*pred.predictions.argmax(-1)))
+    preds = [pred for i, pred in enumerate(preds) if labels[i] != -100]
+    labels = [lab for lab in labels if lab != -100]
+
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='micro')
+    acc = accuracy_score(labels, preds)
+    # map_verdict_to_index = {0:'Not enough Information', 1: 'Supported', 2:'Refuted'}
+    class_rep = classification_report(labels, preds, output_dict=True)
+    print(class_rep)
+    print(acc, recall, precision, f1)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall,
+        'class_rep': class_rep
+    }
+
+
+def model_trainer(model_path, train_dataset, test_dataset):
+    # model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels =4)
+    model = RobertaForTokenClassification.from_pretrained('./bert_weights/roberta-base'
+                                                          , num_labels = 3, return_dict=True)
+
+
+    training_args = TrainingArguments(
+    output_dir=model_path,          # output directory
+    num_train_epochs=3,              # total # of training epochs
+    per_device_train_batch_size=16,  # batch size per device during training
+    per_device_eval_batch_size=16,   # batch size for evaluation
+    # warmup_steps=0,                # number of warmup steps for learning rate scheduler
+    weight_decay=0.1,               # strength of weight decay
+    logging_dir=os.path.join(model_path, 'logs'),
+    learning_rate= 5e-5,          # directory for storing logs
+    logging_steps=1000,
+    save_steps = 1000,
+    # save_model = './results_table_to_cell2'
+    )
+
+    trainer = Trainer(
+    model=model,                         # the instantiated 🤗 Transformers model to be trained
+    args=training_args,                  # training arguments, defined above
+    train_dataset=train_dataset,         # training dataset
+    eval_dataset=test_dataset,          # evaluation dataset
+    compute_metrics = compute_metrics,
+    )
+    return trainer, model
+
+
+def report_average(reports):
+    mean_dict = dict()
+    for label in reports[0].keys():
+        dictionary = dict()
+
+        if label in 'accuracy':
+            mean_dict[label] = sum(d[label] for d in reports) / len(reports)
+            continue
+
+        for key in reports[0][label].keys():
+            dictionary[key] = sum(d[label][key] for d in reports) / len(reports)
+        mean_dict[label] = dictionary
+
+    return mean_dict
+
+
+def clean_title(text):
+    text = unquote(text)
+    text = clean(text.strip(),fix_unicode=True,               # fix various unicode errors
+    to_ascii=False,                  # transliterate to closest ASCII representation
+    lower=False,                     # lowercase text
+    no_line_breaks=False,           # fully strip line breaks as opposed to only normalizing them
+    no_urls=True,                  # replace all URLs with a special token
+    no_emails=False,                # replace all email addresses with a special token
+    no_phone_numbers=False,         # replace all phone numbers with a special token
+    no_numbers=False,               # replace all numbers with a special token
+    no_digits=False,                # replace all digits with a special token
+    no_currency_symbols=False,      # replace all currency symbols with a special token
+    no_punct=False,                 # remove punctuations
+    replace_with_url="<URL>",
+    replace_with_email="<EMAIL>",
+    replace_with_phone_number="<PHONE>",
+    replace_with_number="<NUMBER>",
+    replace_with_digit="0",
+    replace_with_currency_symbol="<CUR>",
+    lang="en"                       # set to 'de' for German special handling
+    )
+    return text
+
+
+def get_wikipage_by_id(id, db):
+    page = id.split('_')[0]
+    page = clean_title(page)
+    page = unicodedata.normalize('NFD', page).strip()
+    # pa = wiki_processor.process_title(page)
+    # print(page)
+    lines = db.get_doc_json(page)
+    # print(lines)
+    pa = WikiPage(page, lines)
+    return pa, page
+
+
+def convert_evidence_into_tables(annotation, db):
+    evidence = annotation.get_evidence()[0] #only bother with first set for now
+    all_cells = []
+    all_cells_id = []
+    for piece in evidence:
+        if '_cell_' in piece:
+            all_cells.append(piece)
+            all_cells_id.append('_'.join(piece.split('_')[(2 if 'header_cell_' in piece else 1):]))
+    cell_ids_by_table = {}
+    table_by_id = {}
+    for i,cell in enumerate(all_cells):
+        pa, page = get_wikipage_by_id(cell, db)
+        table = pa.get_table_from_cell(all_cells_id[i])
+        tab_id = page + "_"  + table.get_id().replace('t_', 'table_')
+        # print(tab_id)
+        if tab_id in cell_ids_by_table:
+            cell_ids_by_table[tab_id].append(all_cells_id[i])
+        else:
+            cell_ids_by_table[tab_id] = [all_cells_id[i]]
+            table_by_id[tab_id] = table
+    output_tables = []
+    output_labels = []
+    for id, cells in cell_ids_by_table.items():
+        curr_tab = table_by_id[id]
+        table_flat = [annotation.get_claim(), '</s>']
+        labels_flat = [0, 0]
+        for row in curr_tab.rows:
+            for j, cell in enumerate(row.row):
+                table_flat.append(str(cell))
+                if cell.get_id() in cells:
+                    labels_flat.append(1)
+                else:
+                    labels_flat.append(0)
+                if j < len(row.row) -1:
+                    table_flat.append('|')
+                    labels_flat.append(0)
+            table_flat.append('</s>')
+            labels_flat.append(0)
+        output_tables.append(table_flat)
+        output_labels.append(labels_flat)
+    return (output_tables, output_labels)
+
+def tokenize_and_align_labels(text_in, labels_in, tokenizer):
+    ori_text_in = text_in
+    ori_labels_in = labels_in
+    span = 1000
+    label_all_tokens = False
+    all_tokenized_inputs = {}
+    all_labels = []
+
+    for stat in tqdm(range(0, len(ori_text_in), span), desc="tokenize and align labels..."):
+        end = min(stat + span, len(ori_text_in))
+        text_in = ori_text_in[stat:end]
+        labels_in = ori_labels_in[stat:end]
+        tokenized_inputs = tokenizer(
+            text_in,
+            padding=True,
+            truncation=True,
+            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
+            is_split_into_words=True,
+        )
+
+        labels = []
+        for i, label in enumerate(labels_in):
+            word_ids = tokenized_inputs.word_ids(batch_index=i)
+            previous_word_idx = None
+            label_ids = []
+            for word_idx in word_ids:
+                if word_idx is None:
+                    label_ids.append(-100)
+                elif word_idx != previous_word_idx:
+                    label_ids.append(label[word_idx])
+                else:
+                    label_ids.append(label[word_idx] if label_all_tokens else -100)
+                previous_word_idx = word_idx
+            labels.append(label_ids)
+        tokenized_inputs["labels"] = labels
+        all_labels.extend(labels)
+
+        for key, val in tokenized_inputs.items():
+            if key in all_tokenized_inputs:
+                all_tokenized_inputs[key].extend(val)
+            else:
+                all_tokenized_inputs[key] = val
+
+        # key, value 有用
+    return all_tokenized_inputs, all_labels
+
+def claim_hypothesis_only_bias(annotations_train, annotations_dev, args):
+    db = FeverousDB(args.wiki_path)
+    all_input = []
+    all_labels = []
+
+    all_input_dev = []
+    all_labels_dev = []
+
+    for i, anno in enumerate(tqdm(annotations_train, desc="convert train evidence into tables")):
+        tabs,labs = convert_evidence_into_tables(anno, db)
+        all_input += tabs
+        all_labels += labs
+
+    for i, anno in enumerate(tqdm(annotations_dev, desc="convert dev evidence into tables")):
+        tabs,labs = convert_evidence_into_tables(anno, db)
+        all_input_dev += tabs
+        all_labels_dev += labs
+
+    claim_evidence_type_list = list(zip(all_input, all_labels))
+    text_train, labels_train = process_data(claim_evidence_type_list)
+
+    claim_evidence_type_list_dev = list(zip(all_input_dev, all_labels_dev))
+    text_dev, labels_dev = process_data(claim_evidence_type_list_dev)
+
+    tokenizer = AutoTokenizer.from_pretrained('./bert_weights/roberta-base'
+                                              , do_lower_case=True, add_prefix_space=True, model_max_length=512)
+    # results =  []
+
+    text_train, labels_train = tokenize_and_align_labels(text_train, labels_train, tokenizer)
+    text_dev, labels_dev = tokenize_and_align_labels(text_dev, labels_dev, tokenizer)
+
+    train_dataset = FEVEROUSDataset(text_train, labels_train)
+    dev_dataset = FEVEROUSDataset(text_dev, labels_dev)
+
+    trainer, model = model_trainer(args.model_path, train_dataset, dev_dataset)
+    trainer.train()
+    scores = trainer.evaluate()
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_path', type=str, help='/path/to/data', default=None)
+    parser.add_argument('--wiki_path', type=str)
+    parser.add_argument('--model_path', type=str)
+
+    args = parser.parse_args()
+
+    args.data_path_train = os.path.join(args.input_path, 'train.jsonl')
+    args.data_path_dev = os.path.join(args.input_path, 'dev.jsonl')
+
+    anno_processor_train =AnnotationProcessor(args.data_path_train)
+    anno_processor_dev =AnnotationProcessor(args.data_path_dev)
+    annotations_train = [annotation for annotation in anno_processor_train]
+    annotations_dev = [annotation for annotation in anno_processor_dev]
+    claim_hypothesis_only_bias(annotations_train, annotations_dev, args)
+
+if __name__ == "__main__":
+    main()
