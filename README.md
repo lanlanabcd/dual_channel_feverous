@@ -153,7 +153,7 @@ evidence f1: 0.22338531279897525
 
 ### Verdict Prediction
 To train the verdict prediction model run:
-(Or you can download our checkpoint from our checkpoint [dual_channel_checkpoint](https://drive.google.com/drive/folders/17nerxW9hP5sIFGDjtZUNiDdtsYMZIc4a) and place it in the models/prepro_feverous_verdict_predictor directory)
+(Or you can download our checkpoint from our checkpoint [dual_channel_checkpoint](https://drive.google.com/drive/folders/17nerxW9hP5sIFGDjtZUNiDdtsYMZIc4a) and place it in the ***dual_channel_feverous/checkpoints/*** directory)
 ```
 PYTHONPATH=src python src/my_methods/bi_modal_verdict_predictor/train_verdict_predictor.py --data_dir data
 ```
